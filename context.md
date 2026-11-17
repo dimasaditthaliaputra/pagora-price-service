@@ -23,12 +23,23 @@ Pagu** (FR-15, FR-16, BR-01, BR-02, BR-24, NFR-09, NFR-11).
 
 ## 2. Peran repo ini
 
-Microservice **FastAPI yang stateless** dan di-deploy di **VPS AWS** (EC2,
-region Jakarta ap-southeast-3, Docker + Caddy). Tugasnya hanya dua:
+Microservice **FastAPI** yang di-deploy di **VPS AWS** (EC2,
+region Jakarta ap-southeast-3, Docker + Caddy). Tugasnya:
 
 1. Mengambil harga harian rata-rata nasional dari PIHPS BI, lalu
    menormalkannya.
-2. Menghitung regresi linier (OLS) dari riwayat harga yang dikirim Laravel.
+2. Menyimpan riwayat BI 2 tahun sendiri, sinkron tiap 24 jam, dan melatih
+   model hibrida (lihat §6). Ini membuat service **stateful**.
+
+**Keputusan 2026-11-17 (pemilik proyek):**
+- Akurasi diprioritaskan di atas arsitektur stateless. Backtest 2 tahun
+  menunjukkan OLS garis lurus (model awal) errornya ±2× tebakan naive. Model
+  terbaik (regresi autoregresif gabungan) butuh riwayat **semua** komoditas
+  sekaligus, jadi service menyimpan data dan melatih model sendiri. Alternatif
+  "Laravel mengirim riwayat semua komoditas per request" sudah ditawarkan dan
+  tidak dipilih.
+- Model OLS awal (`POST /v1/forecast`) **dihapus**, karena belum dipakai
+  Laravel. Model hibrida menggantikannya di `GET /v1/forecast`.
 
 Service ini dipisah dari Laravel agar pekerjaan berat (scraping BI ±50
 detik/komoditas/tahun) tidak memakan kredit Laravel Cloud, yang anggarannya
@@ -38,17 +49,21 @@ dibatasi ≈ $13/bulan.
 
 | Ada di repo ini | Ada di Laravel, jangan dipindah ke sini |
 |---|---|
-| HTTP ke PIHPS BI, parsing & normalisasi | Penyimpanan riwayat (`commodity_reference_prices`) & prediksi (`price_predictions`) |
-| Regresi linier, R², prediksi per hari | **Rumus Harga Pagu** (`predicted_price × margin`, sementara 1.05; harus berada di satu Service Laravel) |
-| Validasi input & kode error | Penjadwalan sinkronisasi (backfill & inkremental), tombol "Perbarui data" |
+| HTTP ke PIHPS BI, parsing & normalisasi | Penyimpanan riwayat (`commodity_reference_prices`) & prediksi (`price_predictions`) untuk dasbor |
+| Model prediksi hibrida, prediksi per hari | **Rumus Harga Pagu** (`predicted_price × margin`, sementara 1.05; harus berada di satu Service Laravel) |
+| Validasi input & kode error | Penjadwalan sinkronisasi Laravel (backfill & inkremental), tombol "Perbarui data" |
+| Salinan riwayat BI (`DATA_DIR/prices_type{N}.json`), sinkron & latih ulang berkala (loop latar di proses FastAPI) | |
 | Autentikasi API key | Fallback ke data lokal saat BI/service ini mati (BR-24) |
 | | Hak akses (hanya Purchasing & Owner), multi-tenant, dashboard |
 | | Larangan Harga Pagu terlihat Vendor (BR-02) |
 
 Akibatnya:
-- **Jangan menambah database, cache persisten, atau scheduler di sini.** Laravel
-  adalah sumber kebenaran data. Satu-satunya state adalah cache daftar komoditas
-  di memori (TTL `COMMODITY_CACHE_SECONDS`).
+- State yang ada: cache daftar komoditas di memori (TTL
+  `COMMODITY_CACHE_SECONDS`), file riwayat di `DATA_DIR`, model di memori
+  (dilatih ulang dari file saat start), dan satu loop latar untuk sinkronisasi.
+  Jangan menambah database atau scheduler lain tanpa persetujuan. Data ini adalah
+  salinan untuk melatih model. Untuk dasbor dan riwayat, Laravel tetap sumber
+  kebenaran.
 - **Jangan menghitung Harga Pagu di sini.** Service mengembalikan
   `predicted_price`, dan margin ditambahkan oleh Laravel.
 - Service ini tidak mengenal tenant, user, atau vendor.
@@ -59,8 +74,10 @@ Akibatnya:
 Laravel (scheduler harian / tombol "Perbarui data")
   1. GET  /v1/prices   (rentang inkremental sejak tanggal terakhir di DB)
      → simpan ke commodity_reference_prices (source = 'bank_indonesia')
-  2. POST /v1/forecast (riwayat dari DB lokal, horizon_days)
+  2. GET  /v1/forecast?code&horizon_days
      → simpan ke price_predictions + hitung Harga Pagu
+     503 status=syncing     → tampilkan indikator sinkronisasi, coba lagi (Retry-After)
+     503 status=unavailable → pakai prediksi terakhir di DB, atau harga BI terakhir
 Dasbor Analitik hanya membaca DB Laravel, tidak pernah memanggil service ini.
 ```
 
@@ -74,26 +91,34 @@ dengan `API_KEY` di sini).
 ## 4. Kontrak API
 
 Semua endpoint `/v1/*` wajib header `X-API-Key`, yang dibandingkan dengan
-`secrets.compare_digest`. **Kontrak ini dipakai Laravel.** Mengubah nama field,
-format, atau kode status berarti mengubah Laravel juga, jadi lakukan perubahan
-yang kompatibel ke belakang atau buat versi baru (`/v2`).
+`secrets.compare_digest`. Per 2026-11-17 Laravel belum memanggil service ini.
+Setelah Laravel memakainya, mengubah nama field, format, atau kode status berarti
+mengubah Laravel juga, jadi lakukan perubahan yang kompatibel ke belakang atau
+buat versi baru (`/v2`).
 
 | Method | Path | Respons |
 |---|---|---|
 | GET | `/health` | `{"status":"ok"}`, tanpa auth |
 | GET | `/v1/commodities` | `[{code, name, category, unit}]`; `code` berformat `com_N` dan dipetakan ke `commodities.api_reference_code` di Laravel |
 | GET | `/v1/prices?code&start_date&end_date` | `{code, source:"bank_indonesia", region:"national", start_date, end_date, prices:[{date, price}]}`, terurut naik |
-| POST | `/v1/forecast` | Body `{history:[{date, price}], horizon_days}`. Respons `{model:"linear_regression", sample_size, history_start, history_end, slope_per_day, intercept, r_squared, predictions:[{date, price}]}` |
+| GET | `/v1/forecast?code&horizon_days` | `{code, model:"theta"\|"linear_autoregression", volatility, history_end, sample_size, trained_at, syncing, predictions:[{date, price}]}`; satu harga per hari kalender |
+| GET | `/v1/status` | `{phase:"starting"\|"syncing"\|"training"\|"idle", ready, progress:{started_at, done, total, current, backfill}\|null, last_sync, next_sync_at, model_trained_at, failed_codes, commodities:[{code, data_from, data_until, points}]}` |
 
 Kode status:
 - `401`: API key salah atau tidak ada.
 - `422`: input tidak valid. Contohnya kode bukan `com_N`, rentang terbalik atau
-  > `MAX_RANGE_DAYS`, riwayat < `MIN_FORECAST_POINTS`, tanggal ganda, horizon >
-  `MAX_HORIZON_DAYS`, atau tren menghasilkan harga ≤ 0. Laravel memetakan kode
+  > `MAX_RANGE_DAYS`, komoditas belum punya data atau riwayatnya < 60 hari kerja,
+  horizon > `MAX_HORIZON_DAYS`, atau tren menghasilkan harga ≤ 0. Laravel memetakan kode
   ini ke pesan UC-11 3a: "Prediksi harga untuk komoditas ini belum dapat
   dihitung."
 - `502`: BI tidak dapat diakses, mengembalikan non-JSON, atau formatnya berubah.
   Laravel lalu menampilkan data lokal terakhir.
+- `503` (`/v1/forecast`): model belum ada. Body `{status, message, phase,
+  progress, next_sync_at}` + header `Retry-After`. `status:"syncing"` = normal,
+  data sedang diunduh/model dilatih (frontend menampilkan indikator sinkronisasi,
+  bukan error). `status:"unavailable"` = sinkronisasi gagal, dicoba lagi pada
+  `next_sync_at`. Saat sinkronisasi harian, forecast **tidak** 503: model lama
+  tetap dipakai dengan `syncing: true`.
 
 `prices` boleh kosong (`[]`) bila BI tidak punya data nasional untuk rentang
 tersebut. Kondisi ini bukan error.
@@ -131,7 +156,9 @@ Format `GetGridDataKomoditas` dengan `tipe_laporan=1` (harian):
 `"Nov 2026 (V)"`, tanpa tanggal pasti, dan urutannya tidak konsisten.
 
 Etika akses: jangan melakukan request paralel atau berulang ke BI. Satu request
-per komoditas per sinkronisasi sudah cukup. Bila BI mengembalikan 403/429/503,
+per komoditas per sinkronisasi sudah cukup. Sinkronisasi (`app/sync.py`)
+mengikuti aturan ini: berurutan, potongan ≤ 365 hari, komoditas yang gagal
+dicoba lagi di siklus berikutnya (24 jam, atau 15 menit selama belum ada model). Bila BI mengembalikan 403/429/503,
 gagal dengan `502`, jangan mencoba ulang dalam loop.
 
 Bila format BI berubah: buka halaman di atas, periksa tab Network atau cari
@@ -140,31 +167,38 @@ fixture di `tests/fixtures/` dari respons asli yang dipangkas.
 
 ## 6. Model regresi
 
-`app/forecast.py`, OLS dengan numpy:
+### Hibrida (`app/hybrid.py`)
 
-```
-harga = intercept + slope × x,   x = selisih hari kalender sejak tanggal riwayat pertama
-slope = Σ(x−x̄)(y−ȳ) / Σ(x−x̄)²,  intercept = ȳ − slope·x̄
-R² = 1 − SS_res / SS_tot   (SS_tot = 0 → R² = 1)
-```
+- Volatilitas = simpangan baku perubahan log harga harian, 250 hari kerja
+  terakhir. Ambang **0,4%** ditetapkan dari data tahun pertama saja.
+- Volatilitas < 0,4% → **Theta**: level SES (alpha dipilih dari SSE 1-langkah
+  terkecil, 120 titik terakhir) + ½ × slope OLS 60 hari kalender terakhir ×
+  hari ke depan (Hyndman & Billah, 2003).
+- Lainnya → **regresi linier autoregresif (ridge, λ=10)** pada log harga.
+  Fitur: perubahan log 1/5/20 hari kerja, jarak log harga dari rata-rata 20 &
+  60 hari kerja. Satu model per horizon hari kerja (direct multi-step), dilatih
+  gabungan dari semua komoditas. Prediksi = harga terakhir × exp(ŷ).
+- Prediksi per hari kerja (Senin-Jumat; libur nasional dianggap hari kerja).
+  Sabtu/Minggu = nilai hari kerja sebelumnya. Minimal 60 hari kerja riwayat.
 
-- `x` memakai **hari kalender**, bukan indeks baris, supaya celah akhir pekan
-  dan libur tidak mendistorsi kemiringan. Prediksi dibuat untuk setiap hari
-  kalender `history_end + 1 … + horizon_days`.
-- Riwayat diurutkan dulu. Tanggal ganda ditolak, dan prediksi ≤ 0 ditolak
-  (bukan di-clamp diam-diam).
-- Nilai dibulatkan: harga 2 desimal, koefisien 4 desimal.
-- Model sengaja dibuat sederhana dan mudah dijelaskan untuk laporan akademik.
-  Mengganti model (musiman, ARIMA, dll.) adalah keputusan produk, jadi
-  tanyakan dulu.
+Backtest walk-forward kode produksi (uji Nov 2025–Nov 2026, origin tiap 5 hari
+kerja, horizon 1–21 hari kerja): MAPE 0,71% (≤5 hari kerja), 2,27% (≤21);
+error relatif terhadap naive 0,92; lebih baik dari naive di 18/21 komoditas.
+OLS garis lurus awal di setup yang sama: MAPE 5,00%, error relatif 1,98. Mengubah parameter di
+atas harus disertai backtest ulang.
+
+Model OLS garis lurus awal sudah dihapus. Mengganti model (musiman, ARIMA,
+dll.) adalah keputusan produk, jadi tanyakan dulu.
 
 ## 7. Struktur & konvensi kode
 
 ```
 app/
-  main.py        # FastAPI app, routing, auth, pemetaan error → HTTP
+  main.py        # FastAPI app, routing, auth, pemetaan error → HTTP, start loop latar
   bi_client.py   # BankIndonesiaClient (httpx async) + parse_daily_row
-  forecast.py    # linear_forecast + ForecastError
+  hybrid.py      # Model: Theta + regresi autoregresif ridge, train, hybrid_forecast, ForecastError
+  price_store.py # Riwayat harga lokal (file JSON, tulis atomik)
+  sync.py        # ServiceState (fase/progres), sinkronisasi BI berurutan, latih ulang berkala
   schemas.py     # Model Pydantic (kontrak API)
   config.py      # Settings (pydantic-settings, dari env/.env)
 tests/           # pytest; fixtures/ = potongan respons BI asli
@@ -195,8 +229,10 @@ pendek (≤ 90 hari).
 ## 8. Konfigurasi
 
 Lihat `.env.example`. `API_KEY` wajib (≥ 32 karakter) dan service gagal start
-tanpanya. Default lainnya: `BI_PRICE_TYPE_ID=1`, `MAX_RANGE_DAYS=400`,
-`MIN_FORECAST_POINTS=10`, `MAX_HORIZON_DAYS=90`. `DOMAIN` dipakai Caddy untuk
+tanpanya. Default lainnya: `BI_PRICE_TYPE_ID=3`, `MAX_RANGE_DAYS=400`,
+`MAX_HORIZON_DAYS=90`, `DATA_DIR=data`,
+`HISTORY_DAYS=730`, `SYNC_ENABLED=true`, `SYNC_INTERVAL_HOURS=24`. Di Docker,
+`DATA_DIR` = `/srv/data` dan dipasang sebagai volume `price_data`. `DOMAIN` dipakai Caddy untuk
 HTTPS otomatis. Container aplikasi hanya listen di `127.0.0.1:8000`.
 
 ## 9. Keputusan yang masih terbuka
@@ -206,7 +242,11 @@ Belum diputuskan pemilik proyek per 2026-11-17. Jangan diasumsikan:
 1. **Titik prediksi yang menjadi Harga Pagu.** Usulan: nilai prediksi tertinggi
    dalam horizon 30 hari × 1.05. Pilihan lainnya: prediksi hari ke-30. Ini
    dihitung di Laravel, tetapi memengaruhi `horizon_days` yang dikirim.
-2. **Panjang riwayat untuk regresi.** Usulan: 90 hari terakhir.
+2. ~~Panjang riwayat untuk regresi.~~ Diputuskan: 730 hari (`HISTORY_DAYS`).
+5. ~~Jenis harga BI.~~ Diputuskan kelompok 2026-11-17: **3 = Pedagang Besar**
+   (harga grosir, paling dekat dengan harga beli B2B). Format respons BI sama
+   dengan jenis 1 (diverifikasi 2026-11-17). Backtest akurasi baru diukur untuk
+   jenis 1, jadi perlu diulang untuk jenis 3 setelah backfill selesai.
 3. **Margin Harga Pagu 5%** masih sementara dan perlu divalidasi (keputusan
    teknis Laravel §12 no. 1).
 4. Repo GitHub untuk service ini belum dibuat.
