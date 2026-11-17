@@ -29,7 +29,7 @@ def make_bi_client(handler) -> BankIndonesiaClient:
 
 @pytest.fixture
 def settings() -> Settings:
-    return Settings(api_key=API_KEY, min_forecast_points=3, max_range_days=400, max_horizon_days=90)
+    return Settings(api_key=API_KEY, max_range_days=400, max_horizon_days=90)
 
 
 @pytest.fixture

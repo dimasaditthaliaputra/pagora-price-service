@@ -6,6 +6,8 @@ services:
     # Hanya listen di localhost; ekspos publik lewat Caddy (HTTPS).
     ports:
       - "127.0.0.1:8000:8000"
+    volumes:
+      - price_data:/srv/data
 
   caddy:
     image: caddy:2
@@ -23,3 +25,4 @@ services:
 
 volumes:
   caddy_data:
+  price_data:

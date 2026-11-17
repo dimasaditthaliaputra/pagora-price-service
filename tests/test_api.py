@@ -1,6 +1,14 @@
+from datetime import datetime, timezone
+
+import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app import hybrid
+from app.main import app, service_state
+from app.price_store import PriceStore
+from app.schemas import PricePoint
+from app.sync import IDLE, SYNCING, Progress, ServiceState
+from tests.test_hybrid import business_series, random_walk
 
 
 def test_health_needs_no_api_key():
@@ -9,7 +17,7 @@ def test_health_needs_no_api_key():
 
 def test_requests_without_valid_api_key_are_rejected(client):
     assert client.get("/v1/commodities", headers={"X-API-Key": "wrong"}).status_code == 401
-    assert client.post("/v1/forecast", headers={"X-API-Key": ""}, json={"history": []}).status_code == 401
+    assert client.get("/v1/forecast", headers={"X-API-Key": ""}, params={"code": "com_1"}).status_code == 401
 
 
 def test_commodities_endpoint(client):
@@ -43,21 +51,83 @@ def test_prices_endpoint_validates_input_before_calling_bi(client, bi_requests):
     assert bi_requests == []
 
 
-def test_forecast_endpoint(client):
-    history = [{"date": f"2026-01-0{d}", "price": 100 + 10 * d} for d in range(1, 5)]
+@pytest.fixture
+def state(tmp_path) -> ServiceState:
+    store = PriceStore(tmp_path / "prices.json")
+    for code, seed in (("com_1", 1), ("com_13", 2)):
+        dates, prices = business_series(random_walk(150, 0.02, seed=seed))
+        store.merge(code, [PricePoint(date=d, price=p) for d, p in zip(dates, prices)])
+    return ServiceState(store=store)
 
-    response = client.post("/v1/forecast", json={"history": history, "horizon_days": 2})
+
+@pytest.fixture
+def trained(state) -> ServiceState:
+    state.model = hybrid.train(state.store.snapshot(), hybrid.max_steps(90))
+    state.phase = IDLE
+    return state
+
+
+@pytest.fixture
+def forecast_client(client, state):
+    app.dependency_overrides[service_state] = lambda: state
+    return client
+
+
+def test_forecast_reports_sync_progress_while_model_is_not_ready(forecast_client, state):
+    state.phase = SYNCING
+    state.progress = Progress(started_at=datetime.now(timezone.utc), backfill=True, total=21, done=5, current="com_6")
+
+    response = forecast_client.get("/v1/forecast", params={"code": "com_1"})
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "60"
+    body = response.json()
+    assert body["status"] == "syncing"
+    assert "±35 menit" in body["message"]
+    assert body["progress"]["done"] == 5
+    assert body["progress"]["total"] == 21
+
+
+def test_forecast_reports_unavailable_when_sync_failed(forecast_client, state):
+    state.phase = IDLE
+
+    response = forecast_client.get("/v1/forecast", params={"code": "com_1"})
+
+    assert response.status_code == 503
+    assert response.json()["status"] == "unavailable"
+
+
+def test_forecast_returns_hybrid_prediction(forecast_client, trained):
+    response = forecast_client.get("/v1/forecast", params={"code": "com_13", "horizon_days": 10})
 
     assert response.status_code == 200
     body = response.json()
-    assert body["model"] == "linear_regression"
-    assert body["sample_size"] == 4
-    assert body["predictions"] == [{"date": "2026-01-05", "price": 150.0}, {"date": "2026-01-06", "price": 160.0}]
+    assert body["code"] == "com_13"
+    assert body["model"] == hybrid.AUTOREGRESSION
+    assert body["sample_size"] == 150
+    assert body["syncing"] is False
+    assert len(body["predictions"]) == 10
 
 
-def test_forecast_rejects_insufficient_history_and_excessive_horizon(client):
-    short = [{"date": "2026-01-01", "price": 100}]
-    enough = [{"date": f"2026-01-0{d}", "price": 100} for d in range(1, 5)]
+def test_forecast_keeps_serving_previous_model_during_daily_sync(forecast_client, trained):
+    trained.phase = SYNCING
 
-    assert client.post("/v1/forecast", json={"history": short}).status_code == 422
-    assert client.post("/v1/forecast", json={"history": enough, "horizon_days": 91}).status_code == 422
+    response = forecast_client.get("/v1/forecast", params={"code": "com_1"})
+
+    assert response.status_code == 200
+    assert response.json()["syncing"] is True
+
+
+def test_forecast_validates_input(forecast_client, trained):
+    assert forecast_client.get("/v1/forecast", params={"code": "cat_1"}).status_code == 422
+    assert forecast_client.get("/v1/forecast", params={"code": "com_99"}).status_code == 422
+    assert forecast_client.get("/v1/forecast", params={"code": "com_1", "horizon_days": 91}).status_code == 422
+
+
+def test_status_reports_phase_and_local_data(forecast_client, state):
+    body = forecast_client.get("/v1/status").json()
+
+    assert body["phase"] == "starting"
+    assert body["ready"] is False
+    assert [c["code"] for c in body["commodities"]] == ["com_1", "com_13"]
+    assert body["commodities"][0]["points"] == 150

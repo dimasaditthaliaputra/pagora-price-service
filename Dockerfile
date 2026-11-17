@@ -8,8 +8,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-RUN useradd --system --no-create-home pagora
+RUN useradd --system --no-create-home pagora \
+    && mkdir -p /srv/data && chown pagora /srv/data
 USER pagora
+# Riwayat harga BI untuk model v2; pasang volume agar tidak hilang saat container dibuat ulang.
+VOLUME /srv/data
 
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
