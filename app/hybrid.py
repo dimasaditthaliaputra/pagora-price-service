@@ -1,10 +1,12 @@
 """
 Model hibrida, dipilih dari backtest walk-forward 2 tahun data PIHPS (21 komoditas):
 
-- Komoditas stabil (volatilitas harian < 0,4%): metode Theta, yaitu SES ditambah
+- Komoditas stabil (volatilitas harian <= 0,3%): metode Theta, yaitu SES ditambah
   setengah slope regresi linier 60 hari kalender terakhir (Hyndman & Billah, 2003).
-- Komoditas lain: regresi linier autoregresif (ridge) pada log harga. Satu model
-  per horizon hari kerja, dilatih gabungan dari semua komoditas.
+- Komoditas fluktuatif (>= 0,5%): regresi linier autoregresif (ridge) pada log harga.
+  Satu model per horizon hari kerja, dilatih gabungan dari semua komoditas.
+- Di antaranya: campuran keduanya, bobot regresi naik linier dari 0 ke 1. Ini mencegah
+  komoditas di sekitar ambang (mis. telur) berganti metode secara mendadak.
 
 Prediksi dibuat per hari kerja (Senin-Jumat), lalu Sabtu/Minggu memakai nilai hari
 kerja sebelumnya, sehingga respons tetap berisi satu harga per hari kalender.
@@ -16,7 +18,9 @@ import numpy as np
 
 from app.schemas import PricePoint
 
-VOLATILITY_THRESHOLD = 0.004
+# Rentang campuran ditetapkan ±0,1% di sekitar ambang 0,4% (dari data tahun pertama), bukan dicari dari data uji.
+BLEND_LOW = 0.003
+BLEND_HIGH = 0.005
 VOLATILITY_WINDOW = 250
 FEATURE_LOOKBACK = 60
 MIN_HISTORY = FEATURE_LOOKBACK
@@ -32,6 +36,7 @@ class ForecastError(ValueError):
 
 THETA = "theta"
 AUTOREGRESSION = "linear_autoregression"
+COMBINATION = "combination"
 
 Series = tuple[list[date], np.ndarray]
 
@@ -152,6 +157,25 @@ def recent_slope(dates: list[date], prices: np.ndarray) -> float:
     return 0.0 if spread == 0 else float(np.sum((x - x.mean()) * (y - y.mean())) / spread)
 
 
+def autoregression_weight(volatility: float) -> float:
+    """Bobot regresi autoregresif: 0 di bawah BLEND_LOW, 1 di atas BLEND_HIGH, linier di antaranya."""
+    if BLEND_HIGH == BLEND_LOW:
+        return 1.0 if volatility >= BLEND_HIGH else 0.0
+    return float(np.clip((volatility - BLEND_LOW) / (BLEND_HIGH - BLEND_LOW), 0.0, 1.0))
+
+
+def theta_path(dates: list[date], prices: np.ndarray, business_days: list[date]) -> tuple[float, np.ndarray]:
+    level = ses_level(prices[-SES_WINDOW:])
+    slope = recent_slope(dates, prices)
+    return level, np.array([level + 0.5 * slope * (d - dates[-1]).days for d in business_days])
+
+
+def autoregression_path(model: TrainedModel, prices: np.ndarray, steps: int) -> tuple[float, np.ndarray]:
+    features = feature_matrix(np.log(prices))[-1]
+    last = float(prices[-1])
+    return last, np.array([last * np.exp(m.predict(features)) for m in model.horizons[:steps]])
+
+
 def hybrid_forecast(model: TrainedModel, dates: list[date], prices: np.ndarray, horizon_days: int) -> HybridForecast:
     if len(prices) < MIN_HISTORY:
         raise ForecastError(f"Riwayat minimal {MIN_HISTORY} hari kerja, tersedia {len(prices)}.")
@@ -163,17 +187,15 @@ def hybrid_forecast(model: TrainedModel, dates: list[date], prices: np.ndarray, 
         raise ForecastError(f"Model hanya dilatih sampai {len(model.horizons)} hari kerja ke depan.")
 
     volatility = daily_volatility(prices)
-    if volatility < VOLATILITY_THRESHOLD:
-        method = THETA
-        level = ses_level(prices[-SES_WINDOW:])
-        slope = recent_slope(dates, prices)
-        base = level
-        steps = [level + 0.5 * slope * (d - last).days for d in business_days]
-    else:
-        method = AUTOREGRESSION
-        features = feature_matrix(np.log(prices))[-1]
-        base = float(prices[-1])
-        steps = [base * np.exp(m.predict(features)) for m in model.horizons[:len(business_days)]]
+    weight = autoregression_weight(volatility)
+    base, steps = 0.0, np.zeros(len(business_days))
+    if weight < 1:
+        theta_base, theta_steps = theta_path(dates, prices, business_days)
+        base, steps = base + (1 - weight) * theta_base, steps + (1 - weight) * theta_steps
+    if weight > 0:
+        ar_base, ar_steps = autoregression_path(model, prices, len(business_days))
+        base, steps = base + weight * ar_base, steps + weight * ar_steps
+    method = THETA if weight == 0 else AUTOREGRESSION if weight == 1 else COMBINATION
 
     if any(price <= 0 for price in steps):
         raise ForecastError("Tren menghasilkan harga tidak wajar (≤ 0).")
@@ -182,6 +204,6 @@ def hybrid_forecast(model: TrainedModel, dates: list[date], prices: np.ndarray, 
     for d in calendar:
         if d.weekday() < 5:
             current = next(step)
-        predictions.append(PricePoint(date=d, price=round(current, 2)))
+        predictions.append(PricePoint(date=d, price=round(float(current), 2)))
 
     return HybridForecast(method=method, volatility=round(volatility, 6), predictions=predictions)

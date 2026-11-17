@@ -61,7 +61,7 @@ def test_stable_trend_uses_theta_with_half_slope(model):
     result = hybrid.hybrid_forecast(model, dates, prices, horizon_days=3)
 
     assert result.method == hybrid.THETA
-    assert result.volatility < hybrid.VOLATILITY_THRESHOLD
+    assert result.volatility < hybrid.BLEND_LOW
     first = result.predictions[0]
     assert first.price == pytest.approx(prices[-1] + 0.5 * (first.date - dates[-1]).days)
 
@@ -74,6 +74,26 @@ def test_volatile_series_uses_autoregression(model):
     assert result.method == hybrid.AUTOREGRESSION
     assert len(result.predictions) == 30
     assert all(p.price > 0 for p in result.predictions)
+
+
+def test_autoregression_weight_rises_linearly_between_thresholds():
+    assert hybrid.autoregression_weight(0.002) == 0
+    assert hybrid.autoregression_weight(0.004) == pytest.approx(0.5)
+    assert hybrid.autoregression_weight(0.006) == 1
+
+
+def test_volatility_near_threshold_blends_both_methods(model, monkeypatch):
+    dates, prices = business_series(random_walk(120, 0.02, seed=7))
+
+    def forecast_at(volatility):
+        monkeypatch.setattr(hybrid, "daily_volatility", lambda _: volatility)
+        return hybrid.hybrid_forecast(model, dates, prices, horizon_days=10)
+
+    theta, autoregression, blend = forecast_at(0.001), forecast_at(0.01), forecast_at(0.004)
+
+    assert (theta.method, autoregression.method, blend.method) == (hybrid.THETA, hybrid.AUTOREGRESSION, hybrid.COMBINATION)
+    for t, a, b in zip(theta.predictions, autoregression.predictions, blend.predictions):
+        assert b.price == pytest.approx((t.price + a.price) / 2, abs=0.01)
 
 
 def test_weekends_repeat_previous_business_day(model):

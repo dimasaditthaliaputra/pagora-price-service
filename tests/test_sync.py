@@ -3,6 +3,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import httpx
 
+from app import sync
 from app.price_store import PriceStore
 from app.schemas import PricePoint
 from app.sync import IDLE, ServiceState, date_chunks, maintain, sync_prices
@@ -81,3 +82,30 @@ async def test_without_model_next_sync_is_retried_soon(tmp_path):
     assert state.model is None
     assert state.phase == IDLE
     assert state.next_sync_at - datetime.now(timezone.utc) < timedelta(minutes=16)
+
+
+async def test_sync_can_be_limited_to_specific_commodities(tmp_path):
+    requests: list[httpx.Request] = []
+
+    await sync_prices(recording_client(requests), PriceStore(tmp_path / "prices.json"), TODAY, 30, only={"com_14"})
+
+    assert {r.url.params["comcat_id"] for r in requests} == {"com_14"}
+
+
+async def test_failed_commodity_is_retried_alone_then_back_to_normal_schedule(tmp_path, monkeypatch):
+    monkeypatch.setattr(sync, "RETRY_HOURS", 1e-6)
+    monkeypatch.setattr(sync.hybrid, "train", lambda *args: "model")
+    requests: list[httpx.Request] = []
+    state = ServiceState(store=PriceStore(tmp_path / "prices.json"))
+
+    task = asyncio.create_task(maintain(state, recording_client(requests, failing_code="com_14"), history_days=30,
+                                        max_horizon_days=30, interval_hours=24, sync_enabled=True))
+    for _ in range(500):
+        if state.next_sync_at and state.next_sync_at - datetime.now(timezone.utc) > timedelta(hours=1):
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+
+    assert len(requested_ranges(requests, "com_14")) == 1 + sync.MAX_RETRIES
+    assert len(requested_ranges(requests, "com_1")) == 1
+    assert state.failed_codes == ["com_14"]

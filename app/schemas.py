@@ -32,7 +32,10 @@ class PriceSeries(BaseModel):
 
 class ForecastResponse(BaseModel):
     code: str
-    model: str = Field(description="Metode yang dipakai: 'theta' (komoditas stabil) atau 'linear_autoregression'.")
+    model: str = Field(
+        description="Metode yang dipakai: 'theta' (komoditas stabil), 'linear_autoregression' (fluktuatif), "
+                    "atau 'combination' (campuran keduanya, volatilitas di sekitar ambang).",
+    )
     volatility: float = Field(description="Simpangan baku perubahan log harga harian (0.004 = 0,4%).")
     history_end: date = Field(description="Tanggal harga BI terakhir yang dipakai.")
     sample_size: int = Field(description="Jumlah hari kerja dalam riwayat komoditas ini.")
