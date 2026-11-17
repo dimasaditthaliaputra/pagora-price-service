@@ -4,9 +4,9 @@ Microservice Python (FastAPI) untuk PAGORA UC-11: mengambil harga pangan harian
 dari PIHPS Bank Indonesia dan menghitung prediksi harga dengan **regresi linier**.
 
 Service menyimpan riwayat BI 2 tahun sendiri (file JSON, bukan database), sinkron
-tiap 24 jam, dan memakai model hibrida (Theta + regresi linier autoregresif). Error
-prediksinya ±8% lebih kecil dari tebakan naive dan ±55% lebih kecil dari model OLS
-garis lurus yang dipakai sebelumnya.
+tiap 24 jam, dan memakai model hibrida (Theta + regresi linier autoregresif). Pada
+harga Pedagang Besar, error prediksinya ±5% lebih kecil dari tebakan naive dan
+±53% lebih kecil dari model OLS garis lurus yang dipakai sebelumnya.
 
 Laravel menghitung Harga Pagu (`predicted_price × margin`) dan menjadi fallback
 ketika service ini atau API BI tidak tersedia (PRD BR-24 / NFR-09).
@@ -27,8 +27,10 @@ tidak mencampur data.
 Rentang 1 tahun memakan waktu ±50 detik per komoditas (BI mengirim semua provinsi).
 Service melakukan backfill `HISTORY_DAYS` (default 730 hari) sekali saat pertama jalan
 (±35 menit), lalu sinkronisasi inkremental tiap `SYNC_INTERVAL_HOURS` (dihitung dari
-waktu service start). Request ke BI selalu dikirim berurutan, satu per komoditas. Bila
-belum ada data sama sekali (mis. BI down saat backfill), sinkronisasi dicoba lagi tiap 15 menit.
+waktu service start). Request ke BI selalu dikirim berurutan, satu per komoditas.
+Komoditas yang gagal diunduh dicoba lagi sendirian tiap 15 menit, maksimal 4 kali, lalu
+kembali ke jadwal biasa. Bila belum ada data sama sekali (mis. BI down saat backfill),
+sinkronisasi dicoba lagi tiap 15 menit sampai berhasil.
 
 ## API
 
@@ -71,26 +73,37 @@ Body tanpa field `status` (atau error dari proxy) berarti gangguan sungguhan.
 
 ### Model prediksi (hibrida)
 
-Dipilih dari backtest walk-forward 2 tahun data PIHPS (21 komoditas, Nov 2024–Nov 2026;
-tahun pertama hanya untuk latih, tahun kedua untuk uji):
+Dirancang dari backtest walk-forward 2 tahun data PIHPS Pasar Tradisional (21 komoditas,
+Nov 2024–Nov 2026; tahun pertama hanya untuk latih, tahun kedua untuk uji), lalu diuji
+ulang tanpa penyesuaian pada data Pedagang Besar yang dipakai service:
 
-- **Komoditas stabil** (volatilitas harian log harga < 0,4%, mis. beras, gula, minyak,
-  daging sapi, telur): **metode Theta**, yaitu *simple exponential smoothing* ditambah
+- **Komoditas stabil** (volatilitas harian log harga ≤ 0,3%, mis. beras, gula, minyak,
+  daging sapi): **metode Theta**, yaitu *simple exponential smoothing* ditambah
   setengah slope regresi linier 60 hari terakhir (Hyndman & Billah, 2003).
-- **Komoditas lain** (cabai, bawang, ayam): **regresi linier autoregresif (ridge)** pada
-  log harga. Variabel: perubahan harga 1/5/20 hari kerja dan jarak harga dari rata-rata
-  20 & 60 hari kerja. Satu model per horizon, dilatih gabungan dari semua komoditas.
+- **Komoditas fluktuatif** (≥ 0,5%, mis. cabai, bawang, ayam): **regresi linier
+  autoregresif (ridge)** pada log harga. Variabel: perubahan harga 1/5/20 hari kerja dan
+  jarak harga dari rata-rata 20 & 60 hari kerja. Satu model per horizon, dilatih gabungan
+  dari semua komoditas.
+- **Di antaranya** (0,3–0,5%, mis. telur): campuran keduanya, bobot regresi naik linier.
+  Ini mencegah prediksi melompat saat volatilitas bergeser sedikit melewati ambang.
 
 Prediksi dibuat per hari kerja. Sabtu/Minggu memakai nilai hari kerja sebelumnya.
 
-| Model | MAPE ≤1 minggu | MAPE ≤1 bulan | Error relatif thd. naive | Lebih baik dari naive |
-|---|---|---|---|---|
-| **Hibrida (dipakai)** | **0,71%** | **2,27%** | **0,92** | **18/21 komoditas** |
-| Naive (harga terakhir) | 0,83% | 2,49% | 1,00 | — |
-| OLS garis lurus semua riwayat (sebelumnya) | 4,55% | 5,00% | 1,98 | 0/21 |
+| Jenis harga | Model | MAPE ≤1 minggu | MAPE ≤1 bulan | Error relatif thd. naive | Lebih baik dari naive |
+|---|---|---|---|---|---|
+| **3 Pedagang Besar (dipakai)** | **Hibrida** | **0,93%** | **2,66%** | **0,95** | **16/21 komoditas** |
+| | Naive (harga terakhir) | 0,97% | 2,80% | 1,00 | — |
+| | OLS garis lurus (sebelumnya) | 5,13% | 5,65% | 2,03 | 0/21 |
+| 1 Pasar Tradisional | Hibrida | 0,70% | 2,27% | 0,92 | 18/21 komoditas |
+| | Naive (harga terakhir) | 0,83% | 2,49% | 1,00 | — |
+| | OLS garis lurus (sebelumnya) | 4,55% | 5,00% | 1,98 | 0/21 |
 
-Backtest di atas memakai harga Pasar Tradisional (jenis 1). Akurasi untuk Pedagang
-Besar (jenis 3) belum diukur ulang. Akurasi sangat bergantung pada komoditas: beras/gula ±0,2–0,4%, cabai ±6–10% (MAPE ≤1 bulan).
+Akurasi sangat bergantung pada komoditas: beras/gula ±0,2–0,5%, cabai ±7–11% (MAPE ≤1 bulan,
+Pedagang Besar).
+
+**Keterbatasan:** keunggulan atas naive kecil dan tidak selalu konsisten. Pada periode
+Mei–Nov 2025 (Pedagang Besar, data latih masih < 1 tahun), model setara naive (error
+relatif 1,01). Keunggulan yang konsisten adalah terhadap OLS garis lurus awal.
 Prediksi makin tidak pasti makin jauh horizonnya.
 
 ## Menjalankan

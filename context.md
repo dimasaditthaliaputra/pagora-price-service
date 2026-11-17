@@ -101,7 +101,7 @@ buat versi baru (`/v2`).
 | GET | `/health` | `{"status":"ok"}`, tanpa auth |
 | GET | `/v1/commodities` | `[{code, name, category, unit}]`; `code` berformat `com_N` dan dipetakan ke `commodities.api_reference_code` di Laravel |
 | GET | `/v1/prices?code&start_date&end_date` | `{code, source:"bank_indonesia", region:"national", start_date, end_date, prices:[{date, price}]}`, terurut naik |
-| GET | `/v1/forecast?code&horizon_days` | `{code, model:"theta"\|"linear_autoregression", volatility, history_end, sample_size, trained_at, syncing, predictions:[{date, price}]}`; satu harga per hari kalender |
+| GET | `/v1/forecast?code&horizon_days` | `{code, model:"theta"\|"linear_autoregression"\|"combination", volatility, history_end, sample_size, trained_at, syncing, predictions:[{date, price}]}`; satu harga per hari kalender |
 | GET | `/v1/status` | `{phase:"starting"\|"syncing"\|"training"\|"idle", ready, progress:{started_at, done, total, current, backfill}\|null, last_sync, next_sync_at, model_trained_at, failed_codes, commodities:[{code, data_from, data_until, points}]}` |
 
 Kode status:
@@ -158,7 +158,8 @@ Format `GetGridDataKomoditas` dengan `tipe_laporan=1` (harian):
 Etika akses: jangan melakukan request paralel atau berulang ke BI. Satu request
 per komoditas per sinkronisasi sudah cukup. Sinkronisasi (`app/sync.py`)
 mengikuti aturan ini: berurutan, potongan ≤ 365 hari, komoditas yang gagal
-dicoba lagi di siklus berikutnya (24 jam, atau 15 menit selama belum ada model). Bila BI mengembalikan 403/429/503,
+dicoba lagi sendirian tiap 15 menit, maksimal 4 kali (`MAX_RETRIES`), lalu kembali
+ke jadwal 24 jam. Selama belum ada model, semua dicoba ulang tiap 15 menit. Bila BI mengembalikan 403/429/503,
 gagal dengan `502`, jangan mencoba ulang dalam loop.
 
 Bila format BI berubah: buka halaman di atas, periksa tab Network atau cari
@@ -170,11 +171,15 @@ fixture di `tests/fixtures/` dari respons asli yang dipangkas.
 ### Hibrida (`app/hybrid.py`)
 
 - Volatilitas = simpangan baku perubahan log harga harian, 250 hari kerja
-  terakhir. Ambang **0,4%** ditetapkan dari data tahun pertama saja.
-- Volatilitas < 0,4% → **Theta**: level SES (alpha dipilih dari SSE 1-langkah
+  terakhir. Ambang **0,4%** ditetapkan dari data tahun pertama saja. Rentang
+  campuran ±0,1% di sekitarnya ditetapkan sebelum diuji (tidak dicari dari data uji).
+- Volatilitas ≤ 0,3% → **Theta**: level SES (alpha dipilih dari SSE 1-langkah
   terkecil, 120 titik terakhir) + ½ × slope OLS 60 hari kalender terakhir ×
   hari ke depan (Hyndman & Billah, 2003).
-- Lainnya → **regresi linier autoregresif (ridge, λ=10)** pada log harga.
+- 0,3–0,5% → **campuran** (`model: "combination"`): bobot regresi =
+  (volatilitas − 0,3%) / 0,2%. Menggantikan pergantian mendadak di 0,4% yang
+  membuat telur (Pedagang Besar) berganti metode tiap minggu.
+- ≥ 0,5% → **regresi linier autoregresif (ridge, λ=10)** pada log harga.
   Fitur: perubahan log 1/5/20 hari kerja, jarak log harga dari rata-rata 20 &
   60 hari kerja. Satu model per horizon hari kerja (direct multi-step), dilatih
   gabungan dari semua komoditas. Prediksi = harga terakhir × exp(ŷ).
@@ -182,9 +187,20 @@ fixture di `tests/fixtures/` dari respons asli yang dipangkas.
   Sabtu/Minggu = nilai hari kerja sebelumnya. Minimal 60 hari kerja riwayat.
 
 Backtest walk-forward kode produksi (uji Nov 2025–Nov 2026, origin tiap 5 hari
-kerja, horizon 1–21 hari kerja): MAPE 0,71% (≤5 hari kerja), 2,27% (≤21);
-error relatif terhadap naive 0,92; lebih baik dari naive di 18/21 komoditas.
-OLS garis lurus awal di setup yang sama: MAPE 5,00%, error relatif 1,98. Mengubah parameter di
+kerja, horizon 1–21 hari kerja). Parameter dirancang dari data jenis 1, lalu
+diuji tanpa penyesuaian pada jenis 3:
+
+| Jenis harga | MAPE ≤5 hk | MAPE ≤21 hk | Error relatif thd. naive | Menang vs naive | OLS awal (MAPE ≤21 / rel.) |
+|---|---|---|---|---|---|
+| 3 Pedagang Besar (dipakai) | 0,93% | 2,66% | 0,95 | 16/21 | 5,65% / 2,03 |
+| 1 Pasar Tradisional | 0,70% | 2,27% | 0,92 | 18/21 | 5,00% / 1,98 |
+
+Campuran vs pergantian mendadak (error relatif total tidak berubah, ±0,002):
+telur jenis 3 membaik dari 1,18 ke 1,06 (masih sedikit di atas naive).
+
+Keterbatasan: keunggulan atas naive kecil dan tidak konsisten. Pada periode
+Mei–Nov 2025 (jenis 3, data latih < 1 tahun) error relatifnya 1,01 (6/21
+menang). Keunggulan yang konsisten adalah terhadap OLS awal. Mengubah parameter di
 atas harus disertai backtest ulang.
 
 Model OLS garis lurus awal sudah dihapus. Mengganti model (musiman, ARIMA,
@@ -245,8 +261,8 @@ Belum diputuskan pemilik proyek per 2026-11-17. Jangan diasumsikan:
 2. ~~Panjang riwayat untuk regresi.~~ Diputuskan: 730 hari (`HISTORY_DAYS`).
 5. ~~Jenis harga BI.~~ Diputuskan kelompok 2026-11-17: **3 = Pedagang Besar**
    (harga grosir, paling dekat dengan harga beli B2B). Format respons BI sama
-   dengan jenis 1 (diverifikasi 2026-11-17). Backtest akurasi baru diukur untuk
-   jenis 1, jadi perlu diulang untuk jenis 3 setelah backfill selesai.
+   dengan jenis 1 dan datanya lengkap: 522 hari kerja untuk semua 21 komoditas
+   (diverifikasi 2026-11-17). Backtest jenis 3 ada di §6.
 3. **Margin Harga Pagu 5%** masih sementara dan perlu divalidasi (keputusan
    teknis Laravel §12 no. 1).
 4. Repo GitHub untuk service ini belum dibuat.

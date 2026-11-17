@@ -11,8 +11,10 @@ logger = logging.getLogger(__name__)
 
 CHUNK_DAYS = 365
 OVERLAP_DAYS = 7
-# Selama belum ada model (mis. BI down saat backfill pertama), jangan menunggu satu interval penuh.
-NO_MODEL_RETRY_HOURS = 0.25
+# Komoditas yang gagal (atau semua, bila belum ada model) dicoba lagi lebih cepat dari satu interval penuh.
+RETRY_HOURS = 0.25
+# Batas retry cepat bila model sudah ada; setelahnya kembali ke jadwal biasa agar BI tidak dibebani.
+MAX_RETRIES = 4
 
 STARTING = "starting"
 SYNCING = "syncing"
@@ -56,15 +58,15 @@ def date_chunks(start: date, end: date, size_days: int) -> list[tuple[date, date
 
 
 async def sync_prices(client: BankIndonesiaClient, store: PriceStore, today: date, history_days: int,
-                      progress: Progress | None = None) -> list[str]:
+                      progress: Progress | None = None, only: set[str] | None = None) -> list[str]:
     """
     Backfill `history_days` untuk komoditas baru, lalu inkremental sejak tanggal terakhir
     (mundur OVERLAP_DAYS untuk menangkap revisi BI). Request dikirim berurutan, satu per
     komoditas per potongan, tanpa retry: komoditas yang gagal dicoba lagi di sinkronisasi berikutnya.
-    Mengembalikan kode komoditas yang gagal.
+    `only` membatasi sinkronisasi ke kode tertentu (dipakai untuk retry). Mengembalikan kode yang gagal.
     """
     progress = progress or Progress(started_at=datetime.now(timezone.utc), backfill=False)
-    commodities = await client.commodities()
+    commodities = [c for c in await client.commodities() if only is None or c.code in only]
     progress.total = len(commodities)
 
     failed = []
@@ -101,12 +103,16 @@ async def maintain(state: ServiceState, client: BankIndonesiaClient, history_day
                    max_horizon_days: int, interval_hours: float, sync_enabled: bool) -> None:
     """Loop latar: latih dari data yang sudah ada, lalu sinkronkan dan latih ulang tiap interval."""
     await retrain(state, max_horizon_days)
+    retry_codes: set[str] | None = None  # None = semua komoditas
+    retries = 0
     while sync_enabled:
         now = datetime.now(timezone.utc)
         state.phase = SYNCING
         state.progress = Progress(started_at=now, backfill=not state.store.codes())
+        failed: list[str] | None = None  # None = sinkronisasi gagal total (mis. daftar komoditas tak terambil)
         try:
-            state.failed_codes = await sync_prices(client, state.store, date.today(), history_days, state.progress)
+            failed = await sync_prices(client, state.store, date.today(), history_days, state.progress, retry_codes)
+            state.failed_codes = failed
             state.last_sync = datetime.now(timezone.utc)
         except BankIndonesiaError as exception:
             logger.warning("Sinkronisasi BI gagal: %s", exception)
@@ -114,7 +120,15 @@ async def maintain(state: ServiceState, client: BankIndonesiaClient, history_day
             # Loop latar tidak boleh mati diam-diam; coba lagi di interval berikutnya.
             logger.exception("Sinkronisasi gagal karena error tak terduga")
         await retrain(state, max_horizon_days)
-        wait_hours = interval_hours if state.model else min(interval_hours, NO_MODEL_RETRY_HOURS)
+
+        if state.model is None or (failed != [] and retries < MAX_RETRIES):
+            retries += 1
+            if failed:
+                retry_codes = set(failed)
+            wait_hours = min(interval_hours, RETRY_HOURS)
+        else:
+            retries, retry_codes = 0, None
+            wait_hours = interval_hours
         state.progress = None
         state.next_sync_at = datetime.now(timezone.utc) + timedelta(hours=wait_hours)
         state.phase = IDLE
