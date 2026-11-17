@@ -34,7 +34,70 @@ Kode status: `401` API key salah, `422` input/riwayat tidak memenuhi syarat
 Model: `harga = intercept + slope × x`, dengan `x` = jumlah hari kalender sejak tanggal
 riwayat pertama, sehingga celah akhir pekan tidak mendistorsi kemiringan.
 
-## Pengembangan
+## Menjalankan
+
+Prasyarat: salin file env dan isi `API_KEY` (wajib, minimal 32 karakter).
+
+```bash
+cp .env.example .env
+openssl rand -hex 32   # tempel hasilnya ke API_KEY di .env
+```
+
+Variabel lain di `.env.example` punya nilai default dan boleh dibiarkan.
+`DOMAIN` hanya dipakai oleh Caddy (Docker), tidak perlu untuk run lokal.
+
+### Opsi A: Lokal (Python 3.12)
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+
+uvicorn app.main:app --reload --port 8000
+```
+
+### Opsi B: Docker
+
+Untuk mencoba di komputer sendiri:
+
+```bash
+docker compose up -d --build
+docker compose logs -f app       # lihat log
+docker compose down              # hentikan
+```
+
+Container `app` dapat diakses di `http://localhost:8000`. Biarkan `DOMAIN` kosong
+(default `localhost`) agar Caddy tidak mencoba menerbitkan sertifikat publik.
+Untuk deploy dengan domain publik, lihat bagian [Deploy](#deploy-aws-ec2).
+
+Tanpa Compose (hanya service API, tanpa Caddy):
+
+```bash
+docker build -t pagora-price-service .
+docker run --rm -p 8000:8000 --env-file .env pagora-price-service
+```
+
+### Verifikasi
+
+```bash
+curl http://localhost:8000/health
+
+curl -H "X-API-Key: <API_KEY>" http://localhost:8000/v1/commodities
+
+curl -H "X-API-Key: <API_KEY>" \
+  "http://localhost:8000/v1/prices?code=com_1&start_date=2026-11-01&end_date=2026-11-14"
+```
+
+Dokumentasi interaktif (Swagger) tersedia di `http://localhost:8000/docs`.
+
+## Testing
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+Atau tanpa instalasi lokal:
 
 ```bash
 docker run --rm -v "$PWD":/srv -w /srv python:3.12-slim \
