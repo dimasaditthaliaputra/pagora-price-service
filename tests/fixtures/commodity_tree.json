@@ -1,0 +1,9 @@
+{
+  "data": [
+    {"id": "cat_1", "name": "Beras", "cat_id": null, "denomination": "kg", "sort": 1},
+    {"id": "com_1", "name": "Beras Kualitas Bawah I", "cat_id": "cat_1", "denomination": "kg", "sort": 1},
+    {"id": "cat_8", "name": "Cabai Rawit", "cat_id": null, "denomination": "kg", "sort": 8},
+    {"id": "com_14", "name": "Cabai Merah Keriting ", "cat_id": "cat_7", "denomination": "kg", "sort": 14},
+    {"id": "com_16", "name": "Cabai Rawit Merah", "cat_id": "cat_8", "denomination": "kg", "sort": 16}
+  ]
+}
