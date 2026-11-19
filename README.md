@@ -131,7 +131,7 @@ python3 -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-uvicorn app.main:app --reload --port 8000
+uvicorn app.main:app --reload --port 8001
 ```
 
 ### Opsi B: Docker
@@ -144,7 +144,7 @@ docker compose logs -f app       # lihat log
 docker compose down              # hentikan
 ```
 
-Container `app` dapat diakses di `http://localhost:8000`. Riwayat harga disimpan di
+Container `app` dapat diakses di `http://localhost:8001`. Riwayat harga disimpan di
 volume `price_data`, sehingga tetap ada walau container dibuat ulang. Biarkan `DOMAIN` kosong
 (default `localhost`) agar Caddy tidak mencoba menerbitkan sertifikat publik.
 Untuk deploy dengan domain publik, lihat bagian [Deploy](#deploy-aws-ec2).
@@ -153,25 +153,25 @@ Tanpa Compose (hanya service API, tanpa Caddy):
 
 ```bash
 docker build -t pagora-price-service .
-docker run --rm -p 8000:8000 --env-file .env -v pagora-data:/srv/data pagora-price-service
+docker run --rm -p 8001:8001 --env-file .env -v pagora-data:/srv/data pagora-price-service
 ```
 
 ### Verifikasi
 
 ```bash
-curl http://localhost:8000/health
+curl http://localhost:8001/health
 
-curl -H "X-API-Key: <API_KEY>" http://localhost:8000/v1/commodities
+curl -H "X-API-Key: <API_KEY>" http://localhost:8001/v1/commodities
 
 curl -H "X-API-Key: <API_KEY>" \
-  "http://localhost:8000/v1/prices?code=com_1&start_date=2026-11-01&end_date=2026-11-14"
+  "http://localhost:8001/v1/prices?code=com_1&start_date=2026-11-01&end_date=2026-11-14"
 
-curl -H "X-API-Key: <API_KEY>" http://localhost:8000/v1/status
+curl -H "X-API-Key: <API_KEY>" http://localhost:8001/v1/status
 
-curl -H "X-API-Key: <API_KEY>" "http://localhost:8000/v1/forecast?code=com_1&horizon_days=30"
+curl -H "X-API-Key: <API_KEY>" "http://localhost:8001/v1/forecast?code=com_1&horizon_days=30"
 ```
 
-Dokumentasi interaktif (Swagger) tersedia di `http://localhost:8000/docs`.
+Dokumentasi interaktif (Swagger) tersedia di `http://localhost:8001/docs`.
 
 ## Testing
 
