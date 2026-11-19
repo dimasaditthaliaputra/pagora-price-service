@@ -39,9 +39,17 @@ class PriceStore:
     def codes(self) -> list[str]:
         return sorted(self._prices)
 
+    def first_date(self, code: str) -> date | None:
+        prices = self._prices.get(code)
+        return min(prices) if prices else None
+
     def last_date(self, code: str) -> date | None:
         prices = self._prices.get(code)
         return max(prices) if prices else None
+
+    def points(self, code: str, start: date, end: date) -> list[PricePoint]:
+        prices = self._prices.get(code, {})
+        return [PricePoint(date=day, price=prices[day]) for day in sorted(prices) if start <= day <= end]
 
     def merge(self, code: str, points: list[PricePoint]) -> None:
         self._prices.setdefault(code, {}).update({point.date: point.price for point in points})

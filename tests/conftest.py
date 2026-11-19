@@ -7,7 +7,9 @@ from fastapi.testclient import TestClient
 
 from app.bi_client import BankIndonesiaClient
 from app.config import Settings, get_settings
-from app.main import app, bi_client
+from app.main import app, bi_client, service_state
+from app.price_store import PriceStore
+from app.sync import ServiceState
 
 API_KEY = "test-key-0123456789abcdef0123456789abcdef"
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -38,7 +40,13 @@ def bi_requests() -> list[httpx.Request]:
 
 
 @pytest.fixture
-def client(settings, bi_requests):
+def local_store(tmp_path) -> PriceStore:
+    """Salinan riwayat lokal service; kosong kecuali diisi test."""
+    return PriceStore(tmp_path / "local-prices.json")
+
+
+@pytest.fixture
+def client(settings, bi_requests, local_store):
     def handler(request: httpx.Request) -> httpx.Response:
         bi_requests.append(request)
         if request.url.path.endswith("GetRefCommodityAndCategory"):
@@ -49,5 +57,6 @@ def client(settings, bi_requests):
 
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[bi_client] = lambda: make_bi_client(handler)
+    app.dependency_overrides[service_state] = lambda: ServiceState(store=local_store)
     yield TestClient(app, headers={"X-API-Key": API_KEY})
     app.dependency_overrides.clear()

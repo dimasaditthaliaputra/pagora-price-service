@@ -3,7 +3,7 @@ import contextlib
 import logging
 import secrets
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
 
@@ -20,6 +20,7 @@ from app.schemas import (
     CommodityDataStatus,
     ForecastResponse,
     ForecastUnavailable,
+    PricePoint,
     PriceSeries,
     ServiceStatus,
     SyncProgress,
@@ -27,6 +28,7 @@ from app.schemas import (
 from app.sync import ServiceState, maintain
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 
 def price_store_path(settings: Settings) -> Path:
@@ -101,6 +103,7 @@ async def commodities(client: Annotated[BankIndonesiaClient, Depends(bi_client)]
 async def prices(
     client: Annotated[BankIndonesiaClient, Depends(bi_client)],
     settings: Annotated[Settings, Depends(get_settings)],
+    state: Annotated[ServiceState, Depends(service_state)],
     code: Annotated[
         str,
         Query(
@@ -130,12 +133,37 @@ async def prices(
             f"Rentang maksimal {settings.max_range_days} hari.",
         )
 
-    try:
-        points = await client.national_daily_prices(code, start_date, end_date)
-    except BankIndonesiaError as exception:
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exception)) from exception
+    points = await price_points(client, state.store, code, start_date, end_date)
 
     return PriceSeries(code=code, start_date=start_date, end_date=end_date, prices=points)
+
+
+async def price_points(client: BankIndonesiaClient, store: PriceStore, code: str, start: date, end: date) -> list[PricePoint]:
+    """
+    Harga dari salinan riwayat lokal (sumber yang sama dengan data latih model), dan hanya hari
+    setelah tanggal terakhir di salinan itu yang diminta ke BI. Satu request BI untuk 180 hari
+    makan ±15-20 detik; salinan lokal menjawab seketika dan mengurangi beban ke BI.
+    """
+    first, last = store.first_date(code), store.last_date(code)
+
+    if first is None or last is None or first > start:
+        try:
+            return await client.national_daily_prices(code, start, end)
+        except BankIndonesiaError as exception:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exception)) from exception
+
+    local = store.points(code, start, min(end, last))
+    if last >= end:
+        return local
+
+    try:
+        newer = await client.national_daily_prices(code, last + timedelta(days=1), end)
+    except BankIndonesiaError as exception:
+        # Data lokal tetap berguna; hari yang belum ada diminta lagi pada request berikutnya.
+        logger.warning("Harga terbaru %s dari BI gagal diambil, memakai salinan lokal: %s", code, exception)
+        return local
+
+    return local + [point for point in newer if point.date > last]
 
 
 def progress_schema(state: ServiceState) -> SyncProgress | None:
