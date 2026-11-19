@@ -40,7 +40,7 @@ Semua endpoint `/v1/*` wajib header `X-API-Key`.
 |---|---|---|
 | GET | `/health` | Cek hidup, tanpa auth |
 | GET | `/v1/commodities` | Daftar komoditas BI: `code` (`com_N`) dipakai sebagai `commodities.api_reference_code` di Laravel |
-| GET | `/v1/prices?code=com_1&start_date=YYYY-MM-DD&end_date=YYYY-MM-DD` | Harga harian nasional langsung dari BI; rentang maks. `MAX_RANGE_DAYS` |
+| GET | `/v1/prices?code=com_1&start_date=YYYY-MM-DD&end_date=YYYY-MM-DD` | Harga harian nasional dari salinan riwayat lokal (seketika); hanya hari setelah data lokal terakhir yang diminta ke BI. Rentang maks. `MAX_RANGE_DAYS` |
 | GET | `/v1/forecast?code=com_1&horizon_days=30` | Prediksi model hibrida → `code`, `model`, `volatility`, `history_end`, `sample_size`, `trained_at`, `syncing`, `predictions[]` |
 | GET | `/v1/status` | Fase & progres sinkronisasi, `ready`, waktu sinkron/latih terakhir & berikutnya, rentang data per komoditas |
 
@@ -189,12 +189,33 @@ docker run --rm -v "$PWD":/srv -w /srv python:3.12-slim \
 
 ## Deploy (AWS EC2)
 
-1. EC2 Ubuntu, region **ap-southeast-3 (Jakarta)**, `t3.micro` cukup. Security group: buka 22 (IP Anda), 80, 443.
-2. Arahkan DNS A record (mis. `price.domain-anda`) ke Elastic IP instance.
-3. Instal Docker, clone repo ini, lalu:
+Project AWS PAGORA hanya boleh membuat resource di region **ap-southeast-2 (Sydney)**.
+Konfigurasi server (±$12,5/bulan): **t4g.micro** (ARM, CPU credit `standard`), **Ubuntu 24.04
+arm64**, disk **12 GB gp3 terenkripsi**, **Elastic IP**, IMDSv2 wajib, termination protection aktif.
+Akses ke server lewat **Session Manager** (tanpa SSH, port 22 tertutup); IAM role hanya
+`AmazonSSMManagedInstanceCore`. Security group: 80 dan 443 dari mana saja.
+
+1. Saat membuat instance, isi **User data** dengan [`deploy/user-data.sh`](deploy/user-data.sh).
+   Skrip ini memasang Docker, swap 1 GB, clone repo (`main`) ke `/opt/pagora-price-service`,
+   membuat `.env` (izin 600), dan mengecek akses ke BI. Service belum dijalankan.
+2. Pasang Elastic IP ke instance, lalu masuk lewat Session Manager:
    ```bash
-   cp .env.example .env   # isi API_KEY (openssl rand -hex 32) dan DOMAIN
-   docker compose up -d --build
+   aws ssm start-session --target <instance-id> --profile pagora
    ```
-   Caddy menerbitkan sertifikat HTTPS otomatis.
-4. Di Laravel: `PRICE_SERVICE_URL=https://price.domain-anda` dan `PRICE_SERVICE_API_KEY=<API_KEY yang sama>`.
+3. **Cek akses BI dulu.** Bila hasilnya GAGAL, BI memblokir IP server; jangan lanjut.
+   ```bash
+   sudo cat /var/log/pagora-bi-check.log
+   ```
+4. Isi `.env`. Tanpa domain, pakai [sslip.io](https://sslip.io): `DOMAIN` = Elastic IP dengan
+   titik diganti strip, mis. `13-54-1-2.sslip.io`. Caddy tetap menerbitkan sertifikat HTTPS.
+   ```bash
+   cd /opt/pagora-price-service
+   EIP=$(curl -s https://checkip.amazonaws.com)
+   sudo sed -i "s/^API_KEY=.*/API_KEY=$(openssl rand -hex 32)/; s/^DOMAIN=.*/DOMAIN=$(echo "$EIP" | tr . -).sslip.io/" .env
+   sudo grep -E "^(API_KEY|DOMAIN)=" .env   # catat API_KEY untuk Laravel
+   sudo docker compose up -d --build
+   ```
+5. Pantau backfill pertama (±35 menit) lewat `sudo docker compose logs -f app` atau `/v1/status`.
+6. Di Laravel: `PRICE_SERVICE_URL=https://<DOMAIN>` dan `PRICE_SERVICE_API_KEY=<API_KEY yang sama>`.
+
+Jangan pernah menulis API key ke user data, commit, atau issue: repo ini publik.

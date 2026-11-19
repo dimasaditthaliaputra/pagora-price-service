@@ -1,13 +1,16 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+
+import httpx
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app import hybrid
-from app.main import app, service_state
+from app.main import app, bi_client, service_state
 from app.price_store import PriceStore
 from app.schemas import PricePoint
 from app.sync import IDLE, SYNCING, Progress, ServiceState
+from tests.conftest import make_bi_client
 from tests.test_hybrid import business_series, random_walk
 
 
@@ -49,6 +52,61 @@ def test_prices_endpoint_validates_input_before_calling_bi(client, bi_requests):
         assert client.get("/v1/prices", params=params).status_code == 422
 
     assert bi_requests == []
+
+
+def seed_local(store: PriceStore, code: str, prices: dict[str, float]) -> None:
+    store.merge(code, [PricePoint(date=date.fromisoformat(day), price=price) for day, price in prices.items()])
+
+
+def test_prices_come_from_local_history_without_calling_bi(client, bi_requests, local_store):
+    seed_local(local_store, "com_1", {"2026-09-30": 14800, "2026-10-01": 15000, "2026-10-08": 15100, "2026-10-09": 15200})
+
+    response = client.get("/v1/prices", params={"code": "com_1", "start_date": "2026-10-01", "end_date": "2026-10-08"})
+
+    assert response.status_code == 200
+    assert response.json()["prices"] == [{"date": "2026-10-01", "price": 15000.0}, {"date": "2026-10-08", "price": 15100.0}]
+    assert bi_requests == []
+
+
+def test_only_days_after_local_history_are_requested_from_bi(client, bi_requests, local_store):
+    seed_local(local_store, "com_1", {"2026-09-01": 14000, "2026-10-01": 15000, "2026-10-02": 15050})
+
+    response = client.get("/v1/prices", params={"code": "com_1", "start_date": "2026-10-01", "end_date": "2026-10-08"})
+
+    prices = response.json()["prices"]
+    assert prices[:2] == [{"date": "2026-10-01", "price": 15000.0}, {"date": "2026-10-02", "price": 15050.0}]
+    assert [p["date"] for p in prices[2:]] == ["2026-10-06", "2026-10-07", "2026-10-08"]
+    assert len(bi_requests) == 1
+    assert bi_requests[0].url.params["start_date"] == "2026-10-03"
+    assert bi_requests[0].url.params["end_date"] == "2026-10-08"
+
+
+def test_local_history_is_returned_when_bi_fails_for_the_newest_days(client, local_store):
+    seed_local(local_store, "com_1", {"2026-09-01": 14000, "2026-10-01": 15000})
+    app.dependency_overrides[bi_client] = lambda: make_bi_client(lambda request: httpx.Response(503))
+
+    response = client.get("/v1/prices", params={"code": "com_1", "start_date": "2026-10-01", "end_date": "2026-10-08"})
+
+    assert response.status_code == 200
+    assert response.json()["prices"] == [{"date": "2026-10-01", "price": 15000.0}]
+
+
+def test_range_older_than_local_history_is_requested_from_bi_in_full(client, bi_requests, local_store):
+    seed_local(local_store, "com_1", {"2026-10-06": 15000})
+
+    response = client.get("/v1/prices", params={"code": "com_1", "start_date": "2026-10-01", "end_date": "2026-10-08"})
+
+    assert response.status_code == 200
+    assert bi_requests[0].url.params["start_date"] == "2026-10-01"
+    assert response.json()["prices"][0] == {"date": "2026-10-01", "price": 14900.0}
+
+
+def test_bi_failure_without_local_history_is_a_502(client, local_store):
+    app.dependency_overrides[bi_client] = lambda: make_bi_client(lambda request: httpx.Response(503))
+
+    response = client.get("/v1/prices", params={"code": "com_1", "start_date": "2026-10-01", "end_date": "2026-10-08"})
+
+    assert response.status_code == 502
 
 
 @pytest.fixture

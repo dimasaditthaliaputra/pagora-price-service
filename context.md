@@ -23,8 +23,9 @@ Pagu** (FR-15, FR-16, BR-01, BR-02, BR-24, NFR-09, NFR-11).
 
 ## 2. Peran repo ini
 
-Microservice **FastAPI** yang di-deploy di **VPS AWS** (EC2,
-region Jakarta ap-southeast-3, Docker + Caddy). Tugasnya:
+Microservice **FastAPI** yang di-deploy di **VPS AWS** (EC2 t4g.micro, region
+**ap-southeast-2 Sydney** — satu-satunya region project AWS PAGORA, Docker + Caddy,
+HTTPS via `<ip>.sslip.io` karena tanpa domain; lihat README §Deploy). Tugasnya:
 
 1. Mengambil harga harian rata-rata nasional dari PIHPS BI, lalu
    menormalkannya.
@@ -91,8 +92,8 @@ dengan `API_KEY` di sini).
 ## 4. Kontrak API
 
 Semua endpoint `/v1/*` wajib header `X-API-Key`, yang dibandingkan dengan
-`secrets.compare_digest`. Per 2026-11-17 Laravel belum memanggil service ini.
-Setelah Laravel memakainya, mengubah nama field, format, atau kode status berarti
+`secrets.compare_digest`. Sejak 2026-11-19 Laravel memakai `/v1/prices` dan
+`/v1/forecast` (`App\Services\PriceServiceClient`), jadi mengubah nama field, format, atau kode status berarti
 mengubah Laravel juga, jadi lakukan perubahan yang kompatibel ke belakang atau
 buat versi baru (`/v2`).
 
@@ -100,7 +101,7 @@ buat versi baru (`/v2`).
 |---|---|---|
 | GET | `/health` | `{"status":"ok"}`, tanpa auth |
 | GET | `/v1/commodities` | `[{code, name, category, unit}]`; `code` berformat `com_N` dan dipetakan ke `commodities.api_reference_code` di Laravel |
-| GET | `/v1/prices?code&start_date&end_date` | `{code, source:"bank_indonesia", region:"national", start_date, end_date, prices:[{date, price}]}`, terurut naik |
+| GET | `/v1/prices?code&start_date&end_date` | `{code, source:"bank_indonesia", region:"national", start_date, end_date, prices:[{date, price}]}`, terurut naik. Dibaca dari salinan riwayat lokal (sumber yang sama dengan data latih); hanya hari setelah tanggal terakhir lokal yang diminta ke BI. Rentang yang mulai sebelum data lokal → seluruhnya dari BI. BI gagal tetapi ada data lokal → 200 dengan data lokal saja |
 | GET | `/v1/forecast?code&horizon_days` | `{code, model:"theta"\|"linear_autoregression"\|"combination", volatility, history_end, sample_size, trained_at, syncing, predictions:[{date, price}]}`; satu harga per hari kalender |
 | GET | `/v1/status` | `{phase:"starting"\|"syncing"\|"training"\|"idle", ready, progress:{started_at, done, total, current, backfill}\|null, last_sync, next_sync_at, model_trained_at, failed_codes, commodities:[{code, data_from, data_until, points}]}` |
 
@@ -111,7 +112,7 @@ Kode status:
   horizon > `MAX_HORIZON_DAYS`, atau tren menghasilkan harga ≤ 0. Laravel memetakan kode
   ini ke pesan UC-11 3a: "Prediksi harga untuk komoditas ini belum dapat
   dihitung."
-- `502`: BI tidak dapat diakses, mengembalikan non-JSON, atau formatnya berubah.
+- `502`: BI tidak dapat diakses, mengembalikan non-JSON, atau formatnya berubah. Untuk `/v1/prices` hanya bila tidak ada data lokal untuk rentang itu.
   Laravel lalu menampilkan data lokal terakhir.
 - `503` (`/v1/forecast`): model belum ada. Body `{status, message, phase,
   progress, next_sync_at}` + header `Retry-After`. `status:"syncing"` = normal,
@@ -255,9 +256,9 @@ HTTPS otomatis. Container aplikasi hanya listen di `127.0.0.1:8000`.
 
 Belum diputuskan pemilik proyek per 2026-11-17. Jangan diasumsikan:
 
-1. **Titik prediksi yang menjadi Harga Pagu.** Usulan: nilai prediksi tertinggi
-   dalam horizon 30 hari × 1.05. Pilihan lainnya: prediksi hari ke-30. Ini
-   dihitung di Laravel, tetapi memengaruhi `horizon_days` yang dikirim.
+1. ~~Titik prediksi yang menjadi Harga Pagu.~~ Diputuskan pemilik proyek
+   2026-11-19: **prediksi tertinggi dalam 30 hari ke depan × margin**. Laravel
+   memanggil `/v1/forecast` dengan `horizon_days=30`.
 2. ~~Panjang riwayat untuk regresi.~~ Diputuskan: 730 hari (`HISTORY_DAYS`).
 5. ~~Jenis harga BI.~~ Diputuskan kelompok 2026-11-17: **3 = Pedagang Besar**
    (harga grosir, paling dekat dengan harga beli B2B). Format respons BI sama
